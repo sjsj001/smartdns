@@ -1,0 +1,134 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # Run daily at 18:00 UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync_step.outputs.changed }}
+      short_sha: ${{ steps.sync_step.outputs.short_sha }}
+      sha: ${{ steps.sync_step.outputs.sha }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        id: sync_step
+        run: |
+          git remote add upstream https://github.com/pymumu/smartdns.git
+          git fetch upstream master
+
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          FORK_SHA=$(git rev-parse HEAD)
+          SHORT_SHA=${UPSTREAM_SHA:0:7}
+          echo "sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+          if [ "$UPSTREAM_SHA" = "$FORK_SHA" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Fork is up to date with upstream. Skipping."
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Upstream has changes, syncing..."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            # 备份自己的 workflow 文件
+            cp .github/workflows/build-upstream.yml /tmp/build-upstream.yml
+
+            # 直接重置到 upstream，不做 rebase
+            git reset --hard upstream/master
+
+            # 还原 workflow 文件并提交
+            mkdir -p .github/workflows
+            cp /tmp/build-upstream.yml .github/workflows/build-upstream.yml
+            git add .github/workflows/build-upstream.yml
+            git commit -m "chore: add build workflow"
+
+            git push origin master --force-with-lease
+            echo "Sync completed."
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y npm clang libclang-dev libssl-dev pkg-config curl rustup
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            ARCH_ARG="aarch64"
+          else
+            ARCH_ARG="x86_64"
+          fi
+          sh ./package/build-pkg.sh --platform linux --arch $ARCH_ARG --with-ui --static
+
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p release_assets
+          find . -maxdepth 2 -name "smartdns*.tar.gz" | while read f; do
+            filename=$(basename "$f")
+            newname="${filename%.tar.gz}-${{ matrix.arch }}.tar.gz"
+            mv "$f" "release_assets/$newname"
+          done
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartdns-${{ matrix.arch }}
+          path: release_assets/*.tar.gz
+
+  release:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: upstream-${{ needs.sync.outputs.short_sha }}
+          name: Upstream Build ${{ needs.sync.outputs.short_sha }}
+          body: |
+            Automated build from upstream commit https://github.com/pymumu/smartdns/commit/${{ needs.sync.outputs.sha }}
+          files: release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
